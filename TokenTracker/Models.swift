@@ -5,6 +5,7 @@ import Foundation
 enum Provider: String, CaseIterable, Codable, Identifiable {
     case openai = "OpenAI"
     case anthropic = "Anthropic"
+    case bedrock = "AWS Bedrock"
 
     var id: String { rawValue }
 }
@@ -289,14 +290,47 @@ struct PricingTable {
         "o4-mini":     ModelPricing(inputPerMillion: 1.10, outputPerMillion: 4.40, cacheReadPerMillion: 0.55,  cacheWrite5mPerMillion: 1.10, cacheWrite1hPerMillion: 1.10),
     ]
 
+    // Bedrock IDs look like "anthropic.claude-sonnet-4-20250514-v1:0" or
+    // "us.anthropic.claude-sonnet-4-20250514-v1:0" for cross-region inference profiles.
+    // Cache read/write on Bedrock: reads ≈ 0.1x base, writes ≈ same as base (no 5m/1h split).
+    static let bedrock: [String: ModelPricing] = [
+        "anthropic.claude-opus-4":     ModelPricing(inputPerMillion: 15.0, outputPerMillion: 75.0, cacheReadPerMillion: 1.50, cacheWrite5mPerMillion: 15.0,  cacheWrite1hPerMillion: 15.0),
+        "anthropic.claude-sonnet-4":   ModelPricing(inputPerMillion: 3.0,  outputPerMillion: 15.0, cacheReadPerMillion: 0.30, cacheWrite5mPerMillion: 3.0,   cacheWrite1hPerMillion: 3.0),
+        "anthropic.claude-haiku-4":    ModelPricing(inputPerMillion: 1.0,  outputPerMillion: 5.0,  cacheReadPerMillion: 0.10, cacheWrite5mPerMillion: 1.0,   cacheWrite1hPerMillion: 1.0),
+        "anthropic.claude-3-5-sonnet": ModelPricing(inputPerMillion: 3.0,  outputPerMillion: 15.0, cacheReadPerMillion: 0.30, cacheWrite5mPerMillion: 3.0,   cacheWrite1hPerMillion: 3.0),
+        "anthropic.claude-3-5-haiku":  ModelPricing(inputPerMillion: 0.80, outputPerMillion: 4.0,  cacheReadPerMillion: 0.08, cacheWrite5mPerMillion: 0.80,  cacheWrite1hPerMillion: 0.80),
+        "anthropic.claude-3-opus":     ModelPricing(inputPerMillion: 15.0, outputPerMillion: 75.0, cacheReadPerMillion: 1.50, cacheWrite5mPerMillion: 15.0,  cacheWrite1hPerMillion: 15.0),
+        "anthropic.claude-3-sonnet":   ModelPricing(inputPerMillion: 3.0,  outputPerMillion: 15.0, cacheReadPerMillion: 0.30, cacheWrite5mPerMillion: 3.0,   cacheWrite1hPerMillion: 3.0),
+        "anthropic.claude-3-haiku":    ModelPricing(inputPerMillion: 0.25, outputPerMillion: 1.25, cacheReadPerMillion: 0.03, cacheWrite5mPerMillion: 0.25,  cacheWrite1hPerMillion: 0.25),
+        "amazon.nova-pro":             ModelPricing(inputPerMillion: 0.80, outputPerMillion: 3.20, cacheReadPerMillion: 0.20, cacheWrite5mPerMillion: 0.80,  cacheWrite1hPerMillion: 0.80),
+        "amazon.nova-lite":            ModelPricing(inputPerMillion: 0.06, outputPerMillion: 0.24, cacheReadPerMillion: 0.015,cacheWrite5mPerMillion: 0.06,  cacheWrite1hPerMillion: 0.06),
+        "amazon.nova-micro":           ModelPricing(inputPerMillion: 0.035,outputPerMillion: 0.14, cacheReadPerMillion: 0.009,cacheWrite5mPerMillion: 0.035, cacheWrite1hPerMillion: 0.035),
+        "meta.llama3-3-70b":           ModelPricing(inputPerMillion: 0.72, outputPerMillion: 0.72, cacheReadPerMillion: 0.72, cacheWrite5mPerMillion: 0.72,  cacheWrite1hPerMillion: 0.72),
+        "mistral.mistral-large":       ModelPricing(inputPerMillion: 2.0,  outputPerMillion: 6.0,  cacheReadPerMillion: 2.0,  cacheWrite5mPerMillion: 2.0,   cacheWrite1hPerMillion: 2.0),
+    ]
+
     static let defaultPricing = ModelPricing(inputPerMillion: 3.0, outputPerMillion: 15.0, cacheReadPerMillion: 0.30, cacheWrite5mPerMillion: 3.75, cacheWrite1hPerMillion: 6.0)
 
     static func pricing(for model: String, provider: Provider) -> ModelPricing {
-        let table = provider == .anthropic ? anthropic : openai
+        let table: [String: ModelPricing]
+        switch provider {
+        case .anthropic: table = anthropic
+        case .openai:    table = openai
+        case .bedrock:   table = bedrock
+        }
         if let p = table[model] { return p }
+        // Strip cross-region prefixes like "us." / "eu." / "apac." for Bedrock IDs.
+        let normalized = stripRegionPrefix(model)
         for (key, p) in table {
-            if model.hasPrefix(key) { return p }
+            if normalized.contains(key) { return p }
         }
         return defaultPricing
+    }
+
+    private static func stripRegionPrefix(_ id: String) -> String {
+        for prefix in ["us.", "eu.", "apac.", "us-gov."] where id.hasPrefix(prefix) {
+            return String(id.dropFirst(prefix.count))
+        }
+        return id
     }
 }

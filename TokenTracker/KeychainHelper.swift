@@ -67,4 +67,30 @@ enum KeychainHelper {
             else { delete(key: "anthropic_admin_key") }
         }
     }
+
+    // MARK: - AWS Bedrock
+
+    static var awsAccessKeyId: String? {
+        get { load(key: "aws_access_key_id") }
+        set {
+            if let v = newValue, !v.isEmpty { save(key: "aws_access_key_id", value: v) }
+            else { delete(key: "aws_access_key_id") }
+        }
+    }
+
+    static var awsSecretAccessKey: String? {
+        get { load(key: "aws_secret_access_key") }
+        set {
+            if let v = newValue, !v.isEmpty { save(key: "aws_secret_access_key", value: v) }
+            else { delete(key: "aws_secret_access_key") }
+        }
+    }
+
+    static var awsSessionToken: String? {
+        get { load(key: "aws_session_token") }
+        set {
+            if let v = newValue, !v.isEmpty { save(key: "aws_session_token", value: v) }
+            else { delete(key: "aws_session_token") }
+        }
+    }
 }

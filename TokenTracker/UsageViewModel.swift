@@ -12,6 +12,8 @@ final class UsageViewModel: ObservableObject {
     @AppStorage("refreshIntervalMinutes") var refreshInterval: Int = 5
     @AppStorage("enabledOpenAI") var enabledOpenAI: Bool = true
     @AppStorage("enabledAnthropic") var enabledAnthropic: Bool = true
+    @AppStorage("enabledBedrock") var enabledBedrock: Bool = false
+    @AppStorage("bedrockRegion") var bedrockRegion: String = "us-east-1"
 
     private var refreshTimer: Timer?
 
@@ -65,6 +67,19 @@ final class UsageViewModel: ObservableObject {
             if enabledOpenAI, KeychainHelper.openAIKey != nil {
                 do {
                     let usage = try await UsageService.shared.fetchOpenAIUsage(days: dayRange)
+                    results.append(usage)
+                } catch {
+                    newErrors.append(error.localizedDescription)
+                }
+            }
+
+            let bedrockEnabled = enabledBedrock
+            let region = bedrockRegion
+            if bedrockEnabled,
+               KeychainHelper.awsAccessKeyId != nil,
+               KeychainHelper.awsSecretAccessKey != nil {
+                do {
+                    let usage = try await UsageService.shared.fetchBedrockUsage(days: dayRange, region: region)
                     results.append(usage)
                 } catch {
                     newErrors.append(error.localizedDescription)

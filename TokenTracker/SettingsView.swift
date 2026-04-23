@@ -8,6 +8,18 @@ struct SettingsView: View {
     @State private var anthropicSaved = false
     @State private var openAISaved = false
 
+    @State private var awsAccessKeyId: String = ""
+    @State private var awsSecretAccessKey: String = ""
+    @State private var awsSessionToken: String = ""
+    @State private var awsSaved = false
+
+    private let bedrockRegions = [
+        "us-east-1", "us-east-2", "us-west-2",
+        "eu-central-1", "eu-west-1", "eu-west-3",
+        "ap-northeast-1", "ap-southeast-1", "ap-southeast-2",
+        "ap-south-1", "ca-central-1", "sa-east-1",
+    ]
+
     var body: some View {
         TabView {
             apiKeysTab
@@ -20,10 +32,13 @@ struct SettingsView: View {
                     Label("Preferences", systemImage: "gearshape")
                 }
         }
-        .frame(width: 480, height: 320)
+        .frame(width: 520, height: 520)
         .onAppear {
             anthropicKey = KeychainHelper.anthropicKey ?? ""
             openAIKey = KeychainHelper.openAIKey ?? ""
+            awsAccessKeyId = KeychainHelper.awsAccessKeyId ?? ""
+            awsSecretAccessKey = KeychainHelper.awsSecretAccessKey ?? ""
+            awsSessionToken = KeychainHelper.awsSessionToken ?? ""
         }
     }
 
@@ -86,6 +101,52 @@ struct SettingsView: View {
                     }
                 }
             }
+
+            Section {
+                VStack(alignment: .leading, spacing: 8) {
+                    Label("AWS Bedrock", systemImage: "cloud.fill")
+                        .font(.headline)
+                    Text("Requires an IAM user/role with cloudwatch:GetMetricData and cloudwatch:ListMetrics on namespace AWS/Bedrock.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+
+                    TextField("Access Key ID (AKIA… or ASIA…)", text: $awsAccessKeyId)
+                        .textFieldStyle(.roundedBorder)
+                    SecureField("Secret Access Key", text: $awsSecretAccessKey)
+                        .textFieldStyle(.roundedBorder)
+                    SecureField("Session Token (optional, for STS creds)", text: $awsSessionToken)
+                        .textFieldStyle(.roundedBorder)
+
+                    HStack {
+                        Picker("Region", selection: $viewModel.bedrockRegion) {
+                            ForEach(bedrockRegions, id: \.self) { region in
+                                Text(region).tag(region)
+                            }
+                        }
+                        .pickerStyle(.menu)
+
+                        Spacer()
+
+                        Button(awsSaved ? "Saved" : "Save") {
+                            KeychainHelper.awsAccessKeyId = awsAccessKeyId
+                            KeychainHelper.awsSecretAccessKey = awsSecretAccessKey
+                            KeychainHelper.awsSessionToken = awsSessionToken
+                            awsSaved = true
+                            viewModel.refresh()
+                            DispatchQueue.main.asyncAfter(deadline: .now() + 2) {
+                                awsSaved = false
+                            }
+                        }
+                        .disabled(awsAccessKeyId.isEmpty || awsSecretAccessKey.isEmpty)
+                    }
+
+                    if KeychainHelper.awsAccessKeyId != nil, KeychainHelper.awsSecretAccessKey != nil {
+                        Label("Credentials stored in Keychain", systemImage: "checkmark.circle.fill")
+                            .font(.caption)
+                            .foregroundStyle(.green)
+                    }
+                }
+            }
         }
         .formStyle(.grouped)
         .padding()
@@ -98,6 +159,7 @@ struct SettingsView: View {
             Section("Providers") {
                 Toggle("OpenAI", isOn: $viewModel.enabledOpenAI)
                 Toggle("Anthropic", isOn: $viewModel.enabledAnthropic)
+                Toggle("AWS Bedrock", isOn: $viewModel.enabledBedrock)
             }
 
             Section("Refresh Interval") {

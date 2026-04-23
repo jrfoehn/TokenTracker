@@ -313,6 +313,135 @@ actor UsageService {
         return try JSONDecoder().decode(OpenAICostResponse.self, from: data)
     }
 
+    // MARK: - Bedrock
+
+    func fetchBedrockUsage(days: Int = 7, region: String) async throws -> ProviderUsage {
+        guard
+            let keyId = KeychainHelper.awsAccessKeyId, !keyId.isEmpty,
+            let secret = KeychainHelper.awsSecretAccessKey, !secret.isEmpty
+        else {
+            throw UsageError.noApiKey(.bedrock)
+        }
+        let credentials = AWSCredentials(
+            accessKeyId: keyId,
+            secretAccessKey: secret,
+            sessionToken: KeychainHelper.awsSessionToken
+        )
+        let client = BedrockClient(credentials: credentials, region: region, session: session)
+
+        let now = Date()
+        let calendar = Calendar(identifier: .gregorian)
+        let startDate = calendar.date(byAdding: .day, value: -days, to: now)!
+
+        // Discover active model IDs in this region.
+        let modelIds = try await client.listModelIds()
+        guard !modelIds.isEmpty else {
+            return ProviderUsage(
+                provider: .bedrock,
+                totalInputTokens: 0,
+                totalOutputTokens: 0,
+                totalCacheReadTokens: 0,
+                totalCacheWrite5mTokens: 0,
+                totalCacheWrite1hTokens: 0,
+                pastCost: 0, todayCost: 0, totalCost: 0,
+                models: [],
+                fetchedAt: Date()
+            )
+        }
+
+        // 5-minute period keeps datapoint counts well under the 100k limit for 30-day windows.
+        let period = days <= 1 ? 60 : 300
+        let totals = try await client.fetchTokenTotals(
+            modelIds: modelIds,
+            startTime: startDate,
+            endTime: now,
+            period: period
+        )
+
+        // Separate today's window for the "today estimated" field shown in the UI.
+        let todayStart = calendar.startOfDay(for: now)
+        let todayTotals = try await client.fetchTokenTotals(
+            modelIds: modelIds,
+            startTime: todayStart,
+            endTime: now,
+            period: 60
+        )
+
+        func int(_ m: [String: Double]?, _ k: String) -> Int {
+            Int((m?[k] ?? 0).rounded())
+        }
+
+        var models: [ModelUsage] = []
+        var totalCost: Double = 0
+        var todayCost: Double = 0
+        var sumInput = 0, sumOutput = 0, sumCacheRead = 0, sumCacheWrite = 0
+
+        for modelId in modelIds {
+            let m = totals[modelId]
+            let input = int(m, "InputTokenCount")
+            let output = int(m, "OutputTokenCount")
+            let cacheRead = int(m, "CacheReadInputTokenCount")
+            let cacheWrite = int(m, "CacheWriteInputTokenCount")
+            if input + output + cacheRead + cacheWrite == 0 { continue }
+
+            let pricing = PricingTable.pricing(for: modelId, provider: .bedrock)
+            let cost = pricing.cost(
+                uncachedInputTokens: input,
+                outputTokens: output,
+                cacheReadTokens: cacheRead,
+                cacheWrite5mTokens: cacheWrite,
+                cacheWrite1hTokens: 0
+            )
+
+            let t = todayTotals[modelId]
+            let tInput = int(t, "InputTokenCount")
+            let tOutput = int(t, "OutputTokenCount")
+            let tCacheRead = int(t, "CacheReadInputTokenCount")
+            let tCacheWrite = int(t, "CacheWriteInputTokenCount")
+            let todayModelCost = pricing.cost(
+                uncachedInputTokens: tInput,
+                outputTokens: tOutput,
+                cacheReadTokens: tCacheRead,
+                cacheWrite5mTokens: tCacheWrite,
+                cacheWrite1hTokens: 0
+            )
+
+            models.append(ModelUsage(
+                model: modelId,
+                inputTokens: input,
+                outputTokens: output,
+                cacheReadTokens: cacheRead,
+                cacheWrite5mTokens: cacheWrite,
+                cacheWrite1hTokens: 0,
+                cost: cost
+            ))
+            totalCost += cost
+            todayCost += todayModelCost
+            sumInput += input
+            sumOutput += output
+            sumCacheRead += cacheRead
+            sumCacheWrite += cacheWrite
+        }
+        models.sort { $0.cost > $1.cost }
+
+        let pastCost = max(0, totalCost - todayCost)
+        log("[TokenTracker] Bedrock region=\(region) models=\(models.count) tokens in=\(sumInput) out=\(sumOutput) cost=$\(totalCost)")
+
+        return ProviderUsage(
+            provider: .bedrock,
+            totalInputTokens: sumInput,
+            totalOutputTokens: sumOutput,
+            totalCacheReadTokens: sumCacheRead,
+            totalCacheWrite5mTokens: sumCacheWrite,
+            totalCacheWrite1hTokens: 0,
+            pastCost: pastCost,
+            todayCost: todayCost,
+            totalCost: totalCost,
+            models: models,
+            fetchedAt: Date()
+        )
+    }
+
     // MARK: - Anthropic Pagination Helpers
 
     private func fetchAnthropicPaginated<T: Codable>(

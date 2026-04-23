@@ -139,9 +139,16 @@ struct MenuBarView: View {
     }
 
     private func providerIcon(_ provider: Provider) -> some View {
-        Image(systemName: provider == .anthropic ? "brain.head.profile" : "sparkles")
+        let (symbol, color): (String, Color) = {
+            switch provider {
+            case .anthropic: return ("brain.head.profile", .orange)
+            case .openai:    return ("sparkles", .green)
+            case .bedrock:   return ("cloud.fill", .blue)
+            }
+        }()
+        return Image(systemName: symbol)
             .font(.caption)
-            .foregroundStyle(provider == .anthropic ? .orange : .green)
+            .foregroundStyle(color)
     }
 
     private func tokenBadge(label: String, count: Int, color: Color) -> some View {
