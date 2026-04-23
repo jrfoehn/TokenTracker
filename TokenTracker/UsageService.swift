@@ -1,4 +1,24 @@
 import Foundation
+import os
+
+private let logger = Logger(subsystem: "com.tokentracker.app", category: "usage")
+
+private func log(_ msg: String) {
+    logger.info("\(msg)")
+    let logFile = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".tokentracker.log")
+    let line = "\(ISO8601DateFormatter().string(from: Date())) \(msg)\n"
+    if let data = line.data(using: .utf8) {
+        if FileManager.default.fileExists(atPath: logFile.path) {
+            if let handle = try? FileHandle(forWritingTo: logFile) {
+                handle.seekToEndOfFile()
+                handle.write(data)
+                handle.closeFile()
+            }
+        } else {
+            try? data.write(to: logFile)
+        }
+    }
+}
 
 actor UsageService {
     static let shared = UsageService()
@@ -17,63 +37,169 @@ actor UsageService {
         }
 
         let now = Date()
-        let startDate = Calendar.current.date(byAdding: .day, value: -days, to: now)!
+        let calendar = Calendar(identifier: .gregorian)
+        let startDate = calendar.date(byAdding: .day, value: -days, to: now)!
+        // Today's start in UTC for the intraday query
+        let todayStart = calendar.startOfDay(for: now)
+        let endDate = calendar.date(byAdding: .day, value: 1, to: now)!
 
         let formatter = ISO8601DateFormatter()
         formatter.formatOptions = [.withInternetDateTime]
         let startStr = formatter.string(from: startDate)
-        let endStr = formatter.string(from: now)
+        let endStr = formatter.string(from: endDate)
+        let todayStartStr = formatter.string(from: todayStart)
+        let todayEndStr = formatter.string(from: endDate)
 
-        // Fetch usage grouped by model
-        var components = URLComponents(string: "https://api.anthropic.com/v1/organizations/usage_report/messages")!
-        components.queryItems = [
+        // Fetch past days at 1d granularity (completed buckets)
+        var usageComponents = URLComponents(string: "https://api.anthropic.com/v1/organizations/usage_report/messages")!
+        usageComponents.queryItems = [
             URLQueryItem(name: "starting_at", value: startStr),
             URLQueryItem(name: "ending_at", value: endStr),
             URLQueryItem(name: "group_by[]", value: "model"),
             URLQueryItem(name: "bucket_width", value: "1d"),
+            URLQueryItem(name: "limit", value: "31"),
         ]
 
-        var request = URLRequest(url: components.url!)
-        request.setValue("2023-06-01", forHTTPHeaderField: "anthropic-version")
-        request.setValue(apiKey, forHTTPHeaderField: "x-api-key")
+        // Fetch daily usage (completed days) + today's usage at 1h granularity
+        let modelParam = [URLQueryItem(name: "group_by[]", value: "model")]
 
-        let (data, response) = try await session.data(for: request)
-        try validateResponse(response, data: data, provider: .anthropic)
+        let dailyBuckets = try await fetchAnthropicPaginated(
+            baseURL: "https://api.anthropic.com/v1/organizations/usage_report/messages",
+            startStr: startStr,
+            endStr: endStr,
+            apiKey: apiKey,
+            extraParams: modelParam,
+            type: AnthropicUsageResponse.self
+        )
 
-        let usageResponse = try JSONDecoder().decode(AnthropicUsageResponse.self, from: data)
+        // Today's in-progress data (1h granularity captures current day)
+        let todayBuckets = try await fetchAnthropicPaginated(
+            baseURL: "https://api.anthropic.com/v1/organizations/usage_report/messages",
+            startStr: todayStartStr,
+            endStr: todayEndStr,
+            apiKey: apiKey,
+            extraParams: modelParam,
+            type: AnthropicUsageResponse.self,
+            bucketWidth: "1h"
+        )
 
-        // Aggregate by model
-        var modelAgg: [String: (input: Int, output: Int, cached: Int)] = [:]
-        for bucket in usageResponse.data {
-            let model = bucket.model ?? "unknown"
-            var current = modelAgg[model, default: (0, 0, 0)]
-            current.input += bucket.inputTokens ?? 0
-            current.output += bucket.outputTokens ?? 0
-            current.cached += (bucket.inputCachedTokens ?? 0) + (bucket.cacheCreationTokens ?? 0)
-            modelAgg[model] = current
+        // Merge: use daily buckets + today's hourly buckets (daily won't have today)
+        let usageReport = dailyBuckets + todayBuckets
+
+        // Fetch cost report (no group_by for simple totals, with pagination)
+        let costBuckets = await fetchAnthropicCosts(apiKey: apiKey, startStr: startStr, endStr: endStr)
+
+        // Also fetch costs grouped by description to get per-model breakdown
+        let costByModelBuckets = await fetchAnthropicCosts(
+            apiKey: apiKey, startStr: startStr, endStr: endStr,
+            extraParams: [URLQueryItem(name: "group_by[]", value: "description")]
+        )
+
+        // Past days: actual cost from cost API
+        var pastDaysCost: Double = 0
+        for bucket in costBuckets {
+            for result in bucket.results {
+                pastDaysCost += result.dollars
+            }
         }
 
-        let models = modelAgg.map { (model, tokens) -> ModelUsage in
+        // Per-model cost map from grouped cost query (past days only)
+        var costByModel: [String: Double] = [:]
+        for bucket in costByModelBuckets {
+            for result in bucket.results {
+                if let model = result.model {
+                    costByModel[model, default: 0] += result.dollars
+                }
+            }
+        }
+
+        // Aggregate ALL tokens by model (past + today)
+        var modelAgg: [String: (input: Int, output: Int, cacheRead: Int, cacheWrite5m: Int, cacheWrite1h: Int)] = [:]
+        for bucket in usageReport {
+            for result in bucket.results {
+                let model = result.model ?? "unknown"
+                var current = modelAgg[model, default: (0, 0, 0, 0, 0)]
+                current.input += result.uncachedInputTokens ?? 0
+                current.output += result.outputTokens ?? 0
+                current.cacheRead += result.cacheReadInputTokens ?? 0
+                current.cacheWrite5m += result.cacheCreation?.ephemeral5mInputTokens ?? 0
+                current.cacheWrite1h += result.cacheCreation?.ephemeral1hInputTokens ?? 0
+                modelAgg[model] = current
+            }
+        }
+
+        // Aggregate today's tokens separately for cost estimation
+        var todayAgg: [String: (input: Int, output: Int, cacheRead: Int, cacheWrite5m: Int, cacheWrite1h: Int)] = [:]
+        for bucket in todayBuckets {
+            for result in bucket.results {
+                let model = result.model ?? "unknown"
+                var current = todayAgg[model, default: (0, 0, 0, 0, 0)]
+                current.input += result.uncachedInputTokens ?? 0
+                current.output += result.outputTokens ?? 0
+                current.cacheRead += result.cacheReadInputTokens ?? 0
+                current.cacheWrite5m += result.cacheCreation?.ephemeral5mInputTokens ?? 0
+                current.cacheWrite1h += result.cacheCreation?.ephemeral1hInputTokens ?? 0
+                todayAgg[model] = current
+            }
+        }
+
+        // Estimate today's cost from tokens (cost API doesn't have in-progress day)
+        var todayEstimatedCost: Double = 0
+        for (model, tokens) in todayAgg {
             let pricing = PricingTable.pricing(for: model, provider: .anthropic)
+            todayEstimatedCost += pricing.cost(
+                uncachedInputTokens: tokens.input,
+                outputTokens: tokens.output,
+                cacheReadTokens: tokens.cacheRead,
+                cacheWrite5mTokens: tokens.cacheWrite5m,
+                cacheWrite1hTokens: tokens.cacheWrite1h
+            )
+        }
+
+        // Total cost = actual past + estimated today
+        let totalCost = pastDaysCost + todayEstimatedCost
+
+        let models = modelAgg.map { (model, tokens) -> ModelUsage in
+            let actualCost = costByModel[model]
+            let pricing = PricingTable.pricing(for: model, provider: .anthropic)
+            let todayTokens = todayAgg[model, default: (0, 0, 0, 0, 0)]
+            let todayCost = pricing.cost(
+                uncachedInputTokens: todayTokens.input,
+                outputTokens: todayTokens.output,
+                cacheReadTokens: todayTokens.cacheRead,
+                cacheWrite5mTokens: todayTokens.cacheWrite5m,
+                cacheWrite1hTokens: todayTokens.cacheWrite1h
+            )
+            let cost = (actualCost ?? 0) + todayCost
             return ModelUsage(
                 model: model,
                 inputTokens: tokens.input,
                 outputTokens: tokens.output,
-                cachedTokens: tokens.cached,
-                cost: pricing.cost(inputTokens: tokens.input, outputTokens: tokens.output, cachedTokens: tokens.cached)
+                cacheReadTokens: tokens.cacheRead,
+                cacheWrite5mTokens: tokens.cacheWrite5m,
+                cacheWrite1hTokens: tokens.cacheWrite1h,
+                cost: cost
             )
         }.sorted { $0.cost > $1.cost }
 
         let totalInput = models.reduce(0) { $0 + $1.inputTokens }
         let totalOutput = models.reduce(0) { $0 + $1.outputTokens }
-        let totalCached = models.reduce(0) { $0 + $1.cachedTokens }
-        let totalCost = models.reduce(0.0) { $0 + $1.cost }
+        let totalCacheRead = models.reduce(0) { $0 + $1.cacheReadTokens }
+        let totalCacheWrite5m = models.reduce(0) { $0 + $1.cacheWrite5mTokens }
+        let totalCacheWrite1h = models.reduce(0) { $0 + $1.cacheWrite1hTokens }
+
+        log("[TokenTracker] Anthropic tokens - input=\(totalInput), output=\(totalOutput), cacheRead=\(totalCacheRead), cacheWrite5m=\(totalCacheWrite5m), cacheWrite1h=\(totalCacheWrite1h)")
+        log("[TokenTracker] Anthropic cost - pastActual=$\(pastDaysCost), todayEstimated=$\(todayEstimatedCost), total=$\(totalCost)")
 
         return ProviderUsage(
             provider: .anthropic,
             totalInputTokens: totalInput,
             totalOutputTokens: totalOutput,
-            totalCachedTokens: totalCached,
+            totalCacheReadTokens: totalCacheRead,
+            totalCacheWrite5mTokens: totalCacheWrite5m,
+            totalCacheWrite1hTokens: totalCacheWrite1h,
+            pastCost: pastDaysCost,
+            todayCost: todayEstimatedCost,
             totalCost: totalCost,
             models: models,
             fetchedAt: Date()
@@ -108,14 +234,14 @@ actor UsageService {
         let usageResponse = try JSONDecoder().decode(OpenAIUsageResponse.self, from: data)
 
         // Aggregate by model
-        var modelAgg: [String: (input: Int, output: Int, cached: Int)] = [:]
+        var modelAgg: [String: (input: Int, output: Int, cacheRead: Int)] = [:]
         for bucket in usageResponse.data {
             for result in bucket.results {
                 let model = result.model ?? "unknown"
                 var current = modelAgg[model, default: (0, 0, 0)]
                 current.input += result.inputTokens ?? 0
                 current.output += result.outputTokens ?? 0
-                current.cached += result.inputCachedTokens ?? 0
+                current.cacheRead += result.inputCachedTokens ?? 0
                 modelAgg[model] = current
             }
         }
@@ -133,20 +259,27 @@ actor UsageService {
 
         let models = modelAgg.map { (model, tokens) -> ModelUsage in
             let pricing = PricingTable.pricing(for: model, provider: .openai)
-            let estimatedCost = pricing.cost(inputTokens: tokens.input, outputTokens: tokens.output, cachedTokens: tokens.cached)
+            let estimatedCost = pricing.cost(
+                uncachedInputTokens: tokens.input,
+                outputTokens: tokens.output,
+                cacheReadTokens: tokens.cacheRead,
+                cacheWrite5mTokens: 0,
+                cacheWrite1hTokens: 0
+            )
             return ModelUsage(
                 model: model,
                 inputTokens: tokens.input,
                 outputTokens: tokens.output,
-                cachedTokens: tokens.cached,
+                cacheReadTokens: tokens.cacheRead,
+                cacheWrite5mTokens: 0,
+                cacheWrite1hTokens: 0,
                 cost: estimatedCost
             )
         }.sorted { $0.cost > $1.cost }
 
         let totalInput = models.reduce(0) { $0 + $1.inputTokens }
         let totalOutput = models.reduce(0) { $0 + $1.outputTokens }
-        let totalCached = models.reduce(0) { $0 + $1.cachedTokens }
-        // Use actual cost if available, otherwise use estimated
+        let totalCacheRead = models.reduce(0) { $0 + $1.cacheReadTokens }
         let actualTotal = costByModel.values.reduce(0, +)
         let totalCost = actualTotal > 0 ? actualTotal : models.reduce(0.0) { $0 + $1.cost }
 
@@ -154,7 +287,11 @@ actor UsageService {
             provider: .openai,
             totalInputTokens: totalInput,
             totalOutputTokens: totalOutput,
-            totalCachedTokens: totalCached,
+            totalCacheReadTokens: totalCacheRead,
+            totalCacheWrite5mTokens: 0,
+            totalCacheWrite1hTokens: 0,
+            pastCost: totalCost,
+            todayCost: 0,
             totalCost: totalCost,
             models: models,
             fetchedAt: Date()
@@ -174,6 +311,101 @@ actor UsageService {
         let (data, response) = try await session.data(for: request)
         try validateResponse(response, data: data, provider: .openai)
         return try JSONDecoder().decode(OpenAICostResponse.self, from: data)
+    }
+
+    // MARK: - Anthropic Pagination Helpers
+
+    private func fetchAnthropicPaginated<T: Codable>(
+        baseURL: String,
+        startStr: String,
+        endStr: String,
+        apiKey: String,
+        extraParams: [URLQueryItem] = [],
+        type: T.Type,
+        bucketWidth: String = "1d"
+    ) async throws -> [AnthropicUsageBucket] {
+        let limit = bucketWidth == "1h" ? "168" : bucketWidth == "1m" ? "1440" : "31"
+        var allBuckets: [AnthropicUsageBucket] = []
+        var page: String? = nil
+
+        while true {
+            var components = URLComponents(string: baseURL)!
+            var queryItems = [
+                URLQueryItem(name: "starting_at", value: startStr),
+                URLQueryItem(name: "ending_at", value: endStr),
+                URLQueryItem(name: "bucket_width", value: bucketWidth),
+                URLQueryItem(name: "limit", value: limit),
+            ] + extraParams
+
+            if let page = page {
+                queryItems.append(URLQueryItem(name: "page", value: page))
+            }
+            components.queryItems = queryItems
+
+            var request = URLRequest(url: components.url!)
+            request.setValue("2023-06-01", forHTTPHeaderField: "anthropic-version")
+            request.setValue(apiKey, forHTTPHeaderField: "x-api-key")
+
+            let (data, response) = try await session.data(for: request)
+            try validateResponse(response, data: data, provider: .anthropic)
+
+            let decoded = try JSONDecoder().decode(AnthropicUsageResponse.self, from: data)
+            allBuckets.append(contentsOf: decoded.data)
+
+            if decoded.hasMore == true, let nextPage = decoded.nextPage {
+                page = nextPage
+            } else {
+                break
+            }
+        }
+        return allBuckets
+    }
+
+    private func fetchAnthropicCosts(
+        apiKey: String,
+        startStr: String,
+        endStr: String,
+        extraParams: [URLQueryItem] = [],
+        bucketWidth: String = "1d"
+    ) async -> [AnthropicCostBucket] {
+        var allBuckets: [AnthropicCostBucket] = []
+        var page: String? = nil
+
+        do {
+            while true {
+                var components = URLComponents(string: "https://api.anthropic.com/v1/organizations/cost_report")!
+                var queryItems = [
+                    URLQueryItem(name: "starting_at", value: startStr),
+                    URLQueryItem(name: "ending_at", value: endStr),
+                    URLQueryItem(name: "bucket_width", value: "1d"),
+                    URLQueryItem(name: "limit", value: "31"),
+                ] + extraParams
+
+                if let page = page {
+                    queryItems.append(URLQueryItem(name: "page", value: page))
+                }
+                components.queryItems = queryItems
+
+                var request = URLRequest(url: components.url!)
+                request.setValue("2023-06-01", forHTTPHeaderField: "anthropic-version")
+                request.setValue(apiKey, forHTTPHeaderField: "x-api-key")
+
+                let (data, response) = try await session.data(for: request)
+                try validateResponse(response, data: data, provider: .anthropic)
+
+                let decoded = try JSONDecoder().decode(AnthropicCostResponse.self, from: data)
+                allBuckets.append(contentsOf: decoded.data)
+
+                if decoded.hasMore == true, let nextPage = decoded.nextPage {
+                    page = nextPage
+                } else {
+                    break
+                }
+            }
+        } catch {
+            // Cost API failure is non-fatal, we fall back to estimated costs
+        }
+        return allBuckets
     }
 
     // MARK: - Helpers

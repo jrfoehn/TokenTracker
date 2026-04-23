@@ -12,9 +12,11 @@ enum Provider: String, CaseIterable, Codable, Identifiable {
 struct ModelUsage: Identifiable {
     let id = UUID()
     let model: String
-    let inputTokens: Int
+    let inputTokens: Int           // base (uncached) input
     let outputTokens: Int
-    let cachedTokens: Int
+    let cacheReadTokens: Int       // cache hits & refreshes
+    let cacheWrite5mTokens: Int    // 5-minute cache writes
+    let cacheWrite1hTokens: Int    // 1-hour cache writes
     let cost: Double
 }
 
@@ -23,8 +25,12 @@ struct ProviderUsage: Identifiable {
     let provider: Provider
     let totalInputTokens: Int
     let totalOutputTokens: Int
-    let totalCachedTokens: Int
-    let totalCost: Double
+    let totalCacheReadTokens: Int
+    let totalCacheWrite5mTokens: Int
+    let totalCacheWrite1hTokens: Int
+    let pastCost: Double        // actual from cost API (completed days)
+    let todayCost: Double       // estimated from tokens (in-progress day)
+    let totalCost: Double       // pastCost + todayCost
     let models: [ModelUsage]
     let fetchedAt: Date
 }
@@ -52,60 +58,100 @@ struct AnthropicUsageResponse: Codable {
 }
 
 struct AnthropicUsageBucket: Codable {
-    let startTime: String
-    let endTime: String
-    let inputTokens: Int?
-    let outputTokens: Int?
-    let inputCachedTokens: Int?
-    let cacheCreationTokens: Int?
-    let model: String?
-    let workspaceId: String?
+    let startingAt: String
+    let endingAt: String
+    let results: [AnthropicUsageResult]
 
     enum CodingKeys: String, CodingKey {
-        case startTime = "start_time"
-        case endTime = "end_time"
-        case inputTokens = "input_tokens"
-        case outputTokens = "output_tokens"
-        case inputCachedTokens = "input_cached_tokens"
-        case cacheCreationTokens = "cache_creation_tokens"
-        case model
-        case workspaceId = "workspace_id"
+        case startingAt = "starting_at"
+        case endingAt = "ending_at"
+        case results
     }
 }
+
+struct AnthropicUsageResult: Codable {
+    let uncachedInputTokens: Int?
+    let outputTokens: Int?
+    let cacheReadInputTokens: Int?
+    let cacheCreation: AnthropicCacheCreation?
+    let model: String?
+    let workspaceId: String?
+    let apiKeyId: String?
+    let serviceTier: String?
+
+    enum CodingKeys: String, CodingKey {
+        case uncachedInputTokens = "uncached_input_tokens"
+        case outputTokens = "output_tokens"
+        case cacheReadInputTokens = "cache_read_input_tokens"
+        case cacheCreation = "cache_creation"
+        case model
+        case workspaceId = "workspace_id"
+        case apiKeyId = "api_key_id"
+        case serviceTier = "service_tier"
+    }
+}
+
+struct AnthropicCacheCreation: Codable {
+    let ephemeral5mInputTokens: Int?
+    let ephemeral1hInputTokens: Int?
+
+    enum CodingKeys: String, CodingKey {
+        case ephemeral5mInputTokens = "ephemeral_5m_input_tokens"
+        case ephemeral1hInputTokens = "ephemeral_1h_input_tokens"
+    }
+
+    var totalTokens: Int {
+        (ephemeral5mInputTokens ?? 0) + (ephemeral1hInputTokens ?? 0)
+    }
+}
+
+// MARK: - Anthropic Cost API Response Models
 
 struct AnthropicCostResponse: Codable {
     let data: [AnthropicCostBucket]
     let hasMore: Bool?
+    let nextPage: String?
 
     enum CodingKeys: String, CodingKey {
         case data
         case hasMore = "has_more"
+        case nextPage = "next_page"
     }
 }
 
 struct AnthropicCostBucket: Codable {
-    let startTime: String
-    let endTime: String
-    let costs: AnthropicCostBreakdown?
+    let startingAt: String
+    let endingAt: String
+    let results: [AnthropicCostResult]
 
     enum CodingKeys: String, CodingKey {
-        case startTime = "start_time"
-        case endTime = "end_time"
-        case costs
+        case startingAt = "starting_at"
+        case endingAt = "ending_at"
+        case results
     }
 }
 
-struct AnthropicCostBreakdown: Codable {
-    let amount: String?
+struct AnthropicCostResult: Codable {
+    let amount: String?       // cents as decimal string, e.g. "123.45" = $1.2345
     let currency: String?
+    let model: String?
+    let costType: String?
     let description: String?
     let workspaceId: String?
 
     enum CodingKeys: String, CodingKey {
         case amount
         case currency
+        case model
+        case costType = "cost_type"
         case description
         case workspaceId = "workspace_id"
+    }
+
+    /// Amount is in cents (lowest currency units) as a decimal string
+    var dollars: Double {
+        guard let amount = amount, let cents = Double(amount) else { return 0 }
+        return cents / 100.0
     }
 }
 
@@ -205,41 +251,48 @@ struct OpenAICostAmount: Codable {
 struct ModelPricing {
     let inputPerMillion: Double
     let outputPerMillion: Double
-    let cachedInputPerMillion: Double
+    let cacheReadPerMillion: Double     // cache hits & refreshes (0.1x base for Anthropic)
+    let cacheWrite5mPerMillion: Double  // 5-min cache writes (1.25x base for Anthropic)
+    let cacheWrite1hPerMillion: Double  // 1-hour cache writes (2x base for Anthropic)
 
-    func cost(inputTokens: Int, outputTokens: Int, cachedTokens: Int) -> Double {
-        let uncachedInput = max(0, inputTokens - cachedTokens)
-        return (Double(uncachedInput) / 1_000_000.0 * inputPerMillion)
+    func cost(uncachedInputTokens: Int, outputTokens: Int, cacheReadTokens: Int, cacheWrite5mTokens: Int, cacheWrite1hTokens: Int) -> Double {
+        return (Double(uncachedInputTokens) / 1_000_000.0 * inputPerMillion)
              + (Double(outputTokens) / 1_000_000.0 * outputPerMillion)
-             + (Double(cachedTokens) / 1_000_000.0 * cachedInputPerMillion)
+             + (Double(cacheReadTokens) / 1_000_000.0 * cacheReadPerMillion)
+             + (Double(cacheWrite5mTokens) / 1_000_000.0 * cacheWrite5mPerMillion)
+             + (Double(cacheWrite1hTokens) / 1_000_000.0 * cacheWrite1hPerMillion)
     }
 }
 
 struct PricingTable {
     static let anthropic: [String: ModelPricing] = [
-        "claude-opus-4-6": ModelPricing(inputPerMillion: 5.0, outputPerMillion: 25.0, cachedInputPerMillion: 0.5),
-        "claude-sonnet-4-6": ModelPricing(inputPerMillion: 3.0, outputPerMillion: 15.0, cachedInputPerMillion: 0.3),
-        "claude-haiku-4-5": ModelPricing(inputPerMillion: 1.0, outputPerMillion: 5.0, cachedInputPerMillion: 0.1),
-        "claude-sonnet-4-5": ModelPricing(inputPerMillion: 3.0, outputPerMillion: 15.0, cachedInputPerMillion: 0.3),
-        "claude-opus-4-5": ModelPricing(inputPerMillion: 5.0, outputPerMillion: 25.0, cachedInputPerMillion: 0.5),
+        "claude-opus-4-7":  ModelPricing(inputPerMillion: 5.0,  outputPerMillion: 25.0, cacheReadPerMillion: 0.50,  cacheWrite5mPerMillion: 6.25,  cacheWrite1hPerMillion: 10.0),
+        "claude-opus-4-6":  ModelPricing(inputPerMillion: 5.0,  outputPerMillion: 25.0, cacheReadPerMillion: 0.50,  cacheWrite5mPerMillion: 6.25,  cacheWrite1hPerMillion: 10.0),
+        "claude-opus-4-5":  ModelPricing(inputPerMillion: 5.0,  outputPerMillion: 25.0, cacheReadPerMillion: 0.50,  cacheWrite5mPerMillion: 6.25,  cacheWrite1hPerMillion: 10.0),
+        "claude-opus-4-1":  ModelPricing(inputPerMillion: 15.0, outputPerMillion: 75.0, cacheReadPerMillion: 1.50,  cacheWrite5mPerMillion: 18.75, cacheWrite1hPerMillion: 30.0),
+        "claude-opus-4":    ModelPricing(inputPerMillion: 15.0, outputPerMillion: 75.0, cacheReadPerMillion: 1.50,  cacheWrite5mPerMillion: 18.75, cacheWrite1hPerMillion: 30.0),
+        "claude-sonnet-4-6":ModelPricing(inputPerMillion: 3.0,  outputPerMillion: 15.0, cacheReadPerMillion: 0.30,  cacheWrite5mPerMillion: 3.75,  cacheWrite1hPerMillion: 6.0),
+        "claude-sonnet-4-5":ModelPricing(inputPerMillion: 3.0,  outputPerMillion: 15.0, cacheReadPerMillion: 0.30,  cacheWrite5mPerMillion: 3.75,  cacheWrite1hPerMillion: 6.0),
+        "claude-sonnet-4":  ModelPricing(inputPerMillion: 3.0,  outputPerMillion: 15.0, cacheReadPerMillion: 0.30,  cacheWrite5mPerMillion: 3.75,  cacheWrite1hPerMillion: 6.0),
+        "claude-haiku-4-5": ModelPricing(inputPerMillion: 1.0,  outputPerMillion: 5.0,  cacheReadPerMillion: 0.10,  cacheWrite5mPerMillion: 1.25,  cacheWrite1hPerMillion: 2.0),
+        "claude-haiku-3-5": ModelPricing(inputPerMillion: 0.80, outputPerMillion: 4.0,  cacheReadPerMillion: 0.08,  cacheWrite5mPerMillion: 1.0,   cacheWrite1hPerMillion: 1.6),
     ]
 
+    // OpenAI: cache read = 0.5x base, no separate 5m/1h distinction
     static let openai: [String: ModelPricing] = [
-        "gpt-4o": ModelPricing(inputPerMillion: 2.5, outputPerMillion: 10.0, cachedInputPerMillion: 1.25),
-        "gpt-4o-mini": ModelPricing(inputPerMillion: 0.15, outputPerMillion: 0.60, cachedInputPerMillion: 0.075),
-        "gpt-4-turbo": ModelPricing(inputPerMillion: 10.0, outputPerMillion: 30.0, cachedInputPerMillion: 5.0),
-        "o1": ModelPricing(inputPerMillion: 15.0, outputPerMillion: 60.0, cachedInputPerMillion: 7.5),
-        "o1-mini": ModelPricing(inputPerMillion: 1.10, outputPerMillion: 4.40, cachedInputPerMillion: 0.55),
-        "o3": ModelPricing(inputPerMillion: 10.0, outputPerMillion: 40.0, cachedInputPerMillion: 2.5),
-        "o3-mini": ModelPricing(inputPerMillion: 1.10, outputPerMillion: 4.40, cachedInputPerMillion: 0.55),
-        "o4-mini": ModelPricing(inputPerMillion: 1.10, outputPerMillion: 4.40, cachedInputPerMillion: 0.55),
+        "gpt-4o":      ModelPricing(inputPerMillion: 2.5,  outputPerMillion: 10.0, cacheReadPerMillion: 1.25,  cacheWrite5mPerMillion: 2.5,  cacheWrite1hPerMillion: 2.5),
+        "gpt-4o-mini": ModelPricing(inputPerMillion: 0.15, outputPerMillion: 0.60, cacheReadPerMillion: 0.075, cacheWrite5mPerMillion: 0.15, cacheWrite1hPerMillion: 0.15),
+        "gpt-4-turbo": ModelPricing(inputPerMillion: 10.0, outputPerMillion: 30.0, cacheReadPerMillion: 5.0,   cacheWrite5mPerMillion: 10.0, cacheWrite1hPerMillion: 10.0),
+        "o1":          ModelPricing(inputPerMillion: 15.0, outputPerMillion: 60.0, cacheReadPerMillion: 7.5,   cacheWrite5mPerMillion: 15.0, cacheWrite1hPerMillion: 15.0),
+        "o3":          ModelPricing(inputPerMillion: 10.0, outputPerMillion: 40.0, cacheReadPerMillion: 2.5,   cacheWrite5mPerMillion: 10.0, cacheWrite1hPerMillion: 10.0),
+        "o3-mini":     ModelPricing(inputPerMillion: 1.10, outputPerMillion: 4.40, cacheReadPerMillion: 0.55,  cacheWrite5mPerMillion: 1.10, cacheWrite1hPerMillion: 1.10),
+        "o4-mini":     ModelPricing(inputPerMillion: 1.10, outputPerMillion: 4.40, cacheReadPerMillion: 0.55,  cacheWrite5mPerMillion: 1.10, cacheWrite1hPerMillion: 1.10),
     ]
 
-    static let defaultPricing = ModelPricing(inputPerMillion: 3.0, outputPerMillion: 15.0, cachedInputPerMillion: 0.3)
+    static let defaultPricing = ModelPricing(inputPerMillion: 3.0, outputPerMillion: 15.0, cacheReadPerMillion: 0.30, cacheWrite5mPerMillion: 3.75, cacheWrite1hPerMillion: 6.0)
 
     static func pricing(for model: String, provider: Provider) -> ModelPricing {
         let table = provider == .anthropic ? anthropic : openai
-        // Try exact match first, then prefix match
         if let p = table[model] { return p }
         for (key, p) in table {
             if model.hasPrefix(key) { return p }

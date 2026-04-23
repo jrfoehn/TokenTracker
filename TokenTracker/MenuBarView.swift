@@ -89,11 +89,43 @@ struct MenuBarView: View {
                     .foregroundStyle(costColor(usage.totalCost))
             }
 
-            HStack(spacing: 12) {
-                tokenBadge(label: "In", count: usage.totalInputTokens, color: .blue)
-                tokenBadge(label: "Out", count: usage.totalOutputTokens, color: .green)
-                if usage.totalCachedTokens > 0 {
-                    tokenBadge(label: "Cache", count: usage.totalCachedTokens, color: .orange)
+            // Cost breakdown: past + today
+            HStack(spacing: 0) {
+                if usage.pastCost > 0 {
+                    Text("Past: $\(String(format: "%.2f", usage.pastCost))")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
+                if usage.todayCost > 0 {
+                    if usage.pastCost > 0 {
+                        Text("  +  ")
+                            .font(.caption2)
+                            .foregroundStyle(.tertiary)
+                    }
+                    Text("Today: ~$\(String(format: "%.2f", usage.todayCost))")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                    Text(" (est.)")
+                        .font(.caption2)
+                        .foregroundStyle(.tertiary)
+                }
+            }
+
+            VStack(alignment: .leading, spacing: 3) {
+                HStack(spacing: 12) {
+                    tokenBadge(label: "Input", count: usage.totalInputTokens, color: .blue)
+                    tokenBadge(label: "Output", count: usage.totalOutputTokens, color: .green)
+                }
+                HStack(spacing: 12) {
+                    if usage.totalCacheWrite5mTokens > 0 {
+                        tokenBadge(label: "Cache Write 5m", count: usage.totalCacheWrite5mTokens, color: .red)
+                    }
+                    if usage.totalCacheWrite1hTokens > 0 {
+                        tokenBadge(label: "Cache Write 1h", count: usage.totalCacheWrite1hTokens, color: .pink)
+                    }
+                }
+                if usage.totalCacheReadTokens > 0 {
+                    tokenBadge(label: "Cache Hits", count: usage.totalCacheReadTokens, color: .orange)
                 }
             }
 
@@ -198,7 +230,7 @@ struct MenuBarView: View {
                 viewModel.refresh()
             }
 
-            Button(action: { openSettings() }) {
+            SettingsLink {
                 Image(systemName: "gearshape")
                     .font(.caption)
             }
@@ -229,8 +261,4 @@ struct MenuBarView: View {
         return "\(count)"
     }
 
-    private func openSettings() {
-        NSApp.sendAction(Selector(("showSettingsWindow:")), to: nil, from: nil)
-        NSApp.activate(ignoringOtherApps: true)
-    }
 }
